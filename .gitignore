@@ -1,0 +1,21 @@
+# Virtual Environment
+PINNenv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Checkpoints
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Unrelated files
+Swarm RLOptimizing Battery consumption .png
+Swarm RLOptimizing Battery consumption .xmind

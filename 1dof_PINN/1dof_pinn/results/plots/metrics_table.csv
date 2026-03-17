@@ -1,0 +1,7 @@
+Metric,No Control,PID Only,PINN Only (10ms latency),PID + PINN Observer ★
+RMS Error (°),1326.5525,1.9983,0.2301,0.1965
+Max Error (°),1821.8025,4.7692,1.1233,0.8796
+P95 Error (°),1807.4703,3.5212,0.4345,0.3287
+Control Effort (N·m),0.0,0.0682,0.0683,0.0679
+Dist. Est. RMSE,0.1151,0.1125,0.1258,0.1193
+Gust Recovery (s),11.0,0.0,0.0,0.0

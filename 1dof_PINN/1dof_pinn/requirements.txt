@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 1-DoF PINN Disturbance Observer — Simulator Requirements
+# Python version: 3.9 or higher recommended
+# Install with:  pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core Scientific Stack ─────────────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.10.0
+
+# ── Deep Learning ─────────────────────────────────────────────────────────────
+torch>=2.0.0
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.65.0
+pandas>=2.0.0
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+# pyserial>=3.5       # Phase 2 hardware only
+# jupyter>=1.0.0      # If you prefer notebooks

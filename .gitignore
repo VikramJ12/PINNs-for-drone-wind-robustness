@@ -19,3 +19,12 @@ checkpoints/
 # Unrelated files
 Swarm RLOptimizing Battery consumption .png
 Swarm RLOptimizing Battery consumption .xmind
+Literature_Review_PINN_UAV.xlsx
+Current_vs_Future_PINNs_comparison.tex
+
+# Research paper (private, not for version control)
+Research Paper /
+
+# Node modules
+node_modules/
+package-lock.json

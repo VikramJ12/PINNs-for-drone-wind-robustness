@@ -4,7 +4,7 @@ sim/dynamics.py
 Physical model of the 1-DoF rotating arm testbench.
 
 System equation (Newton's second law for rotation):
-    I · θ̈  =  τ_motor  −  b · θ̇  −  τ_wind(t)
+    I · θ̈  =  τ_motor  -  b · θ̇  -  τ_wind(t)
 
 State vector: s = [θ, θ̇]
     θ   = angle from horizontal (radians)
@@ -36,7 +36,7 @@ class BeamParams:
             (not propeller thrust — that is τ_motor).
 
     tau_max : Actuator saturation limit [N·m]
-              The motor+ESC cannot exceed this torque regardless of command.
+              The motor cannot exceed this torque regardless of command.
               Prevents physically unrealistic control signals.
     """
     I:       float = 0.008   # kg·m²

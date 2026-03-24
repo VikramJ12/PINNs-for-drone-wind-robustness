@@ -9,13 +9,13 @@ than white noise — real wind has memory and structure, not instant
 frame-to-frame randomness.
 
 Continuous transfer function:
-    H(s) = σ · √(2L/V)  /  (τ_L · s + 1)     τ_L = L / V
+    H(s) = σ· √(2L/V)  /  (τ_L · s + 1)     τ_L = L / V
 
 Discretised as a first-order autoregressive filter:
     w[k] = a · w[k-1]  +  b_coeff · N(0,1)
 
-    a       = exp(−dt / τ_L)          how much the previous value persists
-    b_coeff = σ · √(1 − a²)           how much new noise enters each step
+    a       = exp( -dt / τ_L)          how much the previous value persists
+    b_coeff = σ · √(1 - a²)           how much new noise enters each step
 
 On top of the continuous turbulence, two deterministic gust events model
 a sudden crosswind hit (t=4s) and a direction reversal (t=9s). These are

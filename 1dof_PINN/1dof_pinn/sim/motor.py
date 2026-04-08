@@ -42,7 +42,20 @@ class MotorParams:
     """
     tau_motor: float = 0.020   # 20ms time constant
     tau_max:   float = 0.5     # N·m
+    @classmethod
+    def for_small(cls):
+        """Small ESC — faster response, lower torque ceiling."""
+        return cls(tau_motor=0.015, tau_max=0.05)
 
+    @classmethod
+    def for_medium(cls):
+        """Medium ESC — current default."""
+        return cls(tau_motor=0.020, tau_max=0.50)
+
+    @classmethod
+    def for_large(cls):
+        """Large ESC — slower response, higher torque ceiling."""
+        return cls(tau_motor=0.030, tau_max=3.00)
 
 @dataclass
 class Motor:

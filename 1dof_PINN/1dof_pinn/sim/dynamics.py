@@ -42,6 +42,20 @@ class BeamParams:
     I:       float = 0.008   # kg·m²
     b:       float = 0.004   # N·m·s/rad
     tau_max: float = 0.5     # N·m
+    @classmethod
+    def small(cls):
+        """3-inch micro class. I=8e-5 kg·m², tau_max=0.05 N·m"""
+        return cls(I=0.00008, b=0.0008, tau_max=0.05)
+
+    @classmethod
+    def medium(cls):
+        """5-inch racing class. Default. I=0.008 kg·m², tau_max=0.50 N·m"""
+        return cls(I=0.008, b=0.004, tau_max=0.5)
+
+    @classmethod
+    def large(cls):
+        """7-inch long-range class. I=0.080 kg·m², tau_max=3.00 N·m"""
+        return cls(I=0.080, b=0.018, tau_max=3.0)
 
 
 def beam_ode(state: np.ndarray,

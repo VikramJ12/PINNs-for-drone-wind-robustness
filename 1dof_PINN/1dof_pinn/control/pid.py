@@ -34,7 +34,20 @@ class PIDParams:
     Kp: float = 1.5
     Ki: float = 0.80
     Kd: float = 0.10
+    @classmethod
+    def for_small(cls):
+        """Gains tuned for small arm. Higher Kp needed due to low inertia."""
+        return cls(Kp=2.0, Ki=1.2, Kd=0.05)
 
+    @classmethod
+    def for_medium(cls):
+        """Gains tuned for medium arm. Current default."""
+        return cls(Kp=1.5, Ki=0.80, Kd=0.10)
+
+    @classmethod
+    def for_large(cls):
+        """Gains tuned for large arm. Higher Kd needed to damp slow oscillations."""
+        return cls(Kp=1.2, Ki=0.50, Kd=0.15)
 
 @dataclass
 class PIDController:

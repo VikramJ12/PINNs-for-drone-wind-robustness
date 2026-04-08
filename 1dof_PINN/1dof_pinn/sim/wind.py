@@ -95,31 +95,62 @@ class DrydenWind:
         self._rng   = np.random.default_rng(self.seed)
 
 
+def make_gust_events(n_gusts: int, t_start: float = 2.0, t_end: float = 13.0) -> List[GustEvent]:
+    """
+    Generate n_gusts evenly-spaced gust events between t_start and t_end.
+
+    Magnitudes alternate between +0.10 N·m and -0.08 N·m, matching the
+    original two-gust default. With n_gusts=2 this reproduces the original
+    events at t=4s and t=9s exactly.
+
+    Parameters
+    ----------
+    n_gusts : number of gust events (0 = no gusts, max typically 5)
+    t_start : earliest possible gust onset [s]
+    t_end   : latest  possible gust onset [s]
+    """
+    if n_gusts == 0:
+        return []
+    magnitudes = [+0.10, -0.08]
+    if n_gusts == 1:
+        onsets = [(t_start + t_end) / 2.0]
+    else:
+        onsets = np.linspace(t_start, t_end, n_gusts).tolist()
+    return [
+        GustEvent(onset_time=t, magnitude=magnitudes[i % len(magnitudes)])
+        for i, t in enumerate(onsets)
+    ]
+
+
 def make_standard_wind(dt: float,
                        intensity: str = "moderate",
-                       seed: int = 42) -> DrydenWind:
-    """Standard experiment wind: turbulence + gust at 4s + reversal at 9s."""
+                       seed: int = 42,
+                       n_gusts: int = 2) -> DrydenWind:
+    """
+    Standard experiment wind: Dryden turbulence + n_gusts deterministic events.
+
+    n_gusts=2 (default) reproduces the original gust at 4s and reversal at 9s.
+    n_gusts=0 gives pure turbulence with no step events.
+    """
     return DrydenWind(
         dt          = dt,
         intensity   = intensity,
         seed        = seed,
-        gust_events = [
-            GustEvent(onset_time=4.0, magnitude= 0.10),
-            GustEvent(onset_time=9.0, magnitude=-0.08),
-        ]
+        gust_events = make_gust_events(n_gusts),
     )
 
 
 def prebuild_wind_profile(dt: float,
                           n_steps: int,
                           intensity: str = "moderate",
-                          seed: int = 42) -> np.ndarray:
+                          seed: int = 42,
+                          n_gusts: int = 2) -> np.ndarray:
     """
     Pre-generate the full wind torque array of shape (n_steps,).
 
     Build once and share across all conditions for a fair comparison.
     """
-    wind    = make_standard_wind(dt, intensity, seed)
+    wind    = make_standard_wind(dt, intensity, seed, n_gusts=n_gusts)
     profile = np.zeros(n_steps, dtype=np.float32)
     for k in range(n_steps):
         profile[k] = wind.step()

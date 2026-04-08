@@ -14,7 +14,7 @@ Outputs saved to results/plots/:
   metrics_table.png        — publication-ready metrics table image
   metrics_table.csv        — raw numbers, importable into Excel / pandas
 """
-
+from typing import Optional
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -25,10 +25,10 @@ import os, sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 from sim.dynamics     import BeamParams, rk4_step
-from sim.wind         import prebuild_wind_profile
+from sim.wind         import prebuild_wind_profile, make_gust_events
 from sim.imu          import IMU
-from sim.motor        import Motor
-from control.pid      import PIDController
+from sim.motor        import Motor,MotorParams
+from control.pid      import PIDController,PIDParams
 from control.observer import PhysicsResidualObserver
 
 # ─── Simulation constants ──────────────────────────────────────────────────────
@@ -56,18 +56,26 @@ RECOVERY_THRESHOLD_DEG = 0.5   # tightened from 2° to show real differentiation
 def run_condition(condition: str,
                   wind_profile: np.ndarray,
                   params: BeamParams,
+                  pid_params: Optional[PIDParams] = None,
+                  motor_params: Optional[MotorParams] = None,
                   imu_seed: int = 0) -> dict:
+    if pid_params   is None: pid_params   = PIDParams()
+    if motor_params is None: motor_params = MotorParams()
     latency = 10 if condition == "pinn_only" else 2
 
-    imu   = IMU(dt=DT, seed=imu_seed)
-    pid   = PIDController(dt=DT)
-    motor = Motor(dt=DT)
-    obs   = PhysicsResidualObserver(dt=DT, latency_steps=latency,
-                                    I=params.I, b=params.b)
+    imu     = IMU(dt=DT, seed=imu_seed)
+    pid     = PIDController(dt=DT, params=pid_params, tau_max=params.tau_max)
+    # Fault 8: pinn_only uses size-aware PD (Ki=0) via PIDController — no more hardcoded gains
+    pinn_pd = PIDController(dt=DT,
+                            params=PIDParams(Kp=pid_params.Kp, Ki=0.0, Kd=pid_params.Kd),
+                            tau_max=params.tau_max)
+    motor   = Motor(dt=DT, params=motor_params)
+    obs     = PhysicsResidualObserver(dt=DT, latency_steps=latency,
+                                      I=params.I, b=params.b)
 
-    state         = np.array([0.0, 0.0])
-    tau_motor     = 0.0
-    pinn_prev_err = 0.0
+    state     = np.array([0.0, 0.0])
+    tau_motor = 0.0
+    hit_limit = False
 
     log = {k: np.zeros(NF) for k in
            ["t", "theta", "theta_dot", "tau_motor",
@@ -92,16 +100,10 @@ def run_condition(condition: str,
             tau_cmd = pid.compute(setpoint, theta, theta_dot, feedforward=0.0)
 
         elif condition == "pinn_only":
-            err           = setpoint - theta
-            derivative    = (err - pinn_prev_err) / DT
-            pinn_prev_err = err
-            tau_pd  = 1.5 * err + 0.10 * derivative
-            tau_cmd = float(np.clip(tau_pd + tau_hat,
-                                    -params.tau_max, params.tau_max))
+            tau_cmd = pinn_pd.compute(setpoint, theta, theta_dot, feedforward=tau_hat)
 
         elif condition == "pid_pinn":
-            tau_cmd = pid.compute(setpoint, theta, theta_dot,
-                                   feedforward=tau_hat)
+            tau_cmd = pid.compute(setpoint, theta, theta_dot, feedforward=tau_hat)
 
         tau_motor = motor.step(tau_cmd)
 
@@ -118,14 +120,24 @@ def run_condition(condition: str,
 
         state = rk4_step(state, tau_motor, tau_wind, params, DT)
 
+        # Fault 7: hard stop at ±180° — arm cannot spin past physical joint limit
+        theta_new, theta_dot_new = state
+        if theta_new > np.pi:
+            state = np.array([np.pi, min(0.0, theta_dot_new)])
+            hit_limit = True
+        elif theta_new < -np.pi:
+            state = np.array([-np.pi, max(0.0, theta_dot_new)])
+            hit_limit = True
+
+    log["hit_limit"] = hit_limit
     return log
 
 
 # ─── Metrics ───────────────────────────────────────────────────────────────────
-def compute_metrics(log: dict, wind_profile: np.ndarray) -> dict:
+def compute_metrics(log: dict, wind_profile: np.ndarray,
+                    gust_onset_times: list = None) -> dict:
     t           = log["t"]
     stable_mask = t >= 3.0
-    gust_mask   = (t >= 4.0) & (t <= 9.0)
 
     err_stable  = log["error"][stable_mask]
     rms_error   = np.sqrt(np.mean(err_stable ** 2))
@@ -133,16 +145,13 @@ def compute_metrics(log: dict, wind_profile: np.ndarray) -> dict:
     p95_error   = np.percentile(np.abs(err_stable), 95)
     ctrl_effort = np.sqrt(np.mean(log["tau_motor"][stable_mask] ** 2))
 
-    tw_true   = wind_profile[::DS][:NF][gust_mask]
-    tw_hat    = log["tau_wind_hat"][gust_mask]
+    # Fault 6: evaluate observer quality over full stable period, not hardcoded gust window
+    tw_true   = wind_profile[::DS][:NF][stable_mask]
+    tw_hat    = log["tau_wind_hat"][stable_mask]
     dist_rmse = np.sqrt(np.mean((tw_hat - tw_true) ** 2))
 
-    gust_start = int(4.0 / (DT * DS))
-    recovery_t = T_END - 4.0
-    for i in range(gust_start, NF):
-        if abs(log["error"][i]) < RECOVERY_THRESHOLD_DEG:
-            recovery_t = (i - gust_start) * DT * DS
-            break
+    # Faults 3+4+5: per-gust recovery, worst case, with unambiguous 0.0 meaning
+    recovery_t = _compute_recovery(log["error"], t, gust_onset_times)
 
     return {
         "RMS Error (°)":        round(rms_error,   4),
@@ -150,12 +159,61 @@ def compute_metrics(log: dict, wind_profile: np.ndarray) -> dict:
         "P95 Error (°)":        round(p95_error,   4),
         "Control Effort (N·m)": round(ctrl_effort, 4),
         "Dist. Est. RMSE":      round(dist_rmse,   4),
-        "Gust Recovery (s)":    round(recovery_t,  4),
+        "Gust Recovery (s)":    recovery_t,
     }
 
 
+def _compute_recovery(error: np.ndarray, t: np.ndarray,
+                      gust_onset_times: list) -> float:
+    """
+    Compute worst-case gust recovery time across all gust events.
+
+    For each gust at t_gust:
+      - Scan forward from t_gust
+      - If error never exceeds threshold: recovery = 0.0  (gust rejected, never disturbed)
+      - If error exceeds threshold: measure time from breach back to below threshold
+      - If never recovers: recovery = remaining simulation time from breach
+
+    Returns -1.0 when no gusts are defined (metric not applicable).
+    Returns the maximum recovery time across all gusts otherwise.
+    """
+    if not gust_onset_times:
+        return -1.0
+
+    worst = 0.0
+    abs_err = np.abs(error)
+
+    for t_gust in gust_onset_times:
+        onset_idx = int(np.searchsorted(t, t_gust))
+        if onset_idx >= len(t):
+            continue
+
+        # find first breach above threshold after gust onset
+        breach_idx = None
+        for i in range(onset_idx, len(t)):
+            if abs_err[i] >= RECOVERY_THRESHOLD_DEG:
+                breach_idx = i
+                break
+
+        if breach_idx is None:
+            # threshold never breached — gust was rejected outright
+            recovery = 0.0
+        else:
+            # find first sample below threshold after breach
+            recovery = float(t[-1] - t[breach_idx])   # default: timeout
+            for i in range(breach_idx + 1, len(t)):
+                if abs_err[i] < RECOVERY_THRESHOLD_DEG:
+                    recovery = float(t[i] - t[breach_idx])
+                    break
+
+        worst = max(worst, recovery)
+
+    return round(worst, 4)
+
+
 # ─── Save metrics as CSV ───────────────────────────────────────────────────────
-def save_metrics_csv(metrics: dict, path: str = "results/plots/metrics_table.csv"):
+def save_metrics_csv(metrics: dict, size: str = "medium", wind: str = "moderate", gusts: int = 2):
+    path = f"results/plots/metrics_table_{size}_{wind}_{gusts}g.csv"
     """
     Save metrics to a CSV file.
     Rows = metrics, Columns = conditions.
@@ -176,7 +234,8 @@ def save_metrics_csv(metrics: dict, path: str = "results/plots/metrics_table.csv
 
 
 # ─── Save metrics as PNG table image ──────────────────────────────────────────
-def save_metrics_png(metrics: dict, path: str = "results/plots/metrics_table.png"):
+def save_metrics_png(metrics: dict, size: str = "medium", wind: str = "moderate", gusts: int = 2):
+    path = f"results/plots/metrics_table_{size}_{wind}_{gusts}g.png"
     """
     Render the metrics table as a styled PNG image.
 
@@ -363,7 +422,8 @@ def print_metrics_table(metrics: dict):
 
 
 # ─── Trajectory plots ──────────────────────────────────────────────────────────
-def plot_results(results: dict, wind_profile: np.ndarray, metrics: dict):
+def plot_results(results: dict, wind_profile: np.ndarray, metrics: dict,
+                 size: str = "medium", wind: str = "moderate", gusts: int = 2):
     t = results["pid_pinn"]["t"]
 
     fig = plt.figure(figsize=(16, 14))
@@ -460,7 +520,7 @@ def plot_results(results: dict, wind_profile: np.ndarray, metrics: dict):
     )
 
     os.makedirs("results/plots", exist_ok=True)
-    out = "results/plots/simulation_results.png"
+    out = f"results/plots/simulation_results_{size}_{wind}_{gusts}g.png"
     plt.savefig(out, dpi=160, bbox_inches="tight", facecolor="#0a0f1e")
     plt.close()
     print(f"Plot saved → {out}")
@@ -468,24 +528,52 @@ def plot_results(results: dict, wind_profile: np.ndarray, metrics: dict):
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Building wind profile...")
-    params       = BeamParams()
-    wind_profile = prebuild_wind_profile(DT, N, intensity="moderate", seed=42)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--size",  choices=["small", "medium", "large"],
+                        default="medium")
+    parser.add_argument("--wind",  choices=["light", "moderate", "severe"],
+                        default="moderate")
+    parser.add_argument("--gusts", type=int, default=2,
+                        choices=range(0, 6), metavar="{0-5}",
+                        help="Number of deterministic gust events (0–5, default 2)")
+    args = parser.parse_args()
+
+    print(f"Arm size : {args.size}")
+    print(f"Wind     : {args.wind}")
+    print(f"Gusts    : {args.gusts}")
+
+    params       = getattr(BeamParams, args.size)()
+    pid_params   = getattr(PIDParams,  f"for_{args.size}")()
+    motor_params = getattr(MotorParams, f"for_{args.size}")()
+    wind_profile      = prebuild_wind_profile(DT, N,
+                                              intensity=args.wind, seed=42,
+                                              n_gusts=args.gusts)
+    gust_onset_times  = [g.onset_time for g in make_gust_events(args.gusts)]
 
     results = {}
     metrics = {}
     for i, cond in enumerate(CONDITIONS):
         print(f"Running: {CONDITIONS[cond]['label']} ...")
-        results[cond] = run_condition(cond, wind_profile, params, imu_seed=i * 7)
-        metrics[cond] = compute_metrics(results[cond], wind_profile)
+        results[cond] = run_condition(cond, wind_profile, params,
+                                      pid_params=pid_params,
+                                      motor_params=motor_params,
+                                      imu_seed=i * 7)
+        metrics[cond] = compute_metrics(results[cond], wind_profile,
+                                        gust_onset_times=gust_onset_times)
 
     print_metrics_table(metrics)
 
     print("Saving outputs...")
     os.makedirs("results/plots", exist_ok=True)
-    plot_results(results, wind_profile, metrics)
-    save_metrics_csv(metrics)
-    save_metrics_png(metrics)
+    plot_results(results, wind_profile, metrics,
+                 size=args.size, wind=args.wind, gusts=args.gusts)
+
+    save_metrics_csv(metrics,
+                     size=args.size, wind=args.wind, gusts=args.gusts)
+
+    save_metrics_png(metrics,
+                     size=args.size, wind=args.wind, gusts=args.gusts)
 
     print("\nAll outputs saved to results/plots/")
     print("  simulation_results.png  — trajectory plots")

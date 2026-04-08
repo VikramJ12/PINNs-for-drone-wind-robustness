@@ -1,7 +1,22 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const I = 0.008, B = 0.004, DT = 0.001, TAU_MAX = 0.5;
+const DT = 0.001;
 const SP_RAD = 10 * Math.PI / 180;
+const RECOVERY_THRESHOLD_DEG = 0.5;
+
+// ── Visual sizing per arm class ────────────────────────────────────────────────
+const ARM_VISUAL = {
+  small:  { armLen: 85,  hubR: 12, propLen: 10, hubDot: 3 },
+  medium: { armLen: 130, hubR: 18, propLen: 14, hubDot: 5 },
+  large:  { armLen: 155, hubR: 24, propLen: 20, hubDot: 7 },
+};
+
+// ── Arm configurations — mirrors Python BeamParams / PIDParams / MotorParams ──
+const ARM_CONFIGS = {
+  small:  { I: 8e-5,  b: 0.0008, tauMax: 0.05,  motorTau: 0.015, Kp: 2.0, Ki: 1.2,  Kd: 0.05,  label: 'Small (3")',  sub: 'I=8×10⁻⁵ kg·m²  ·  b=0.0008' },
+  medium: { I: 0.008, b: 0.004,  tauMax: 0.50,  motorTau: 0.020, Kp: 1.5, Ki: 0.80, Kd: 0.10,  label: 'Medium (5")', sub: 'I=0.008 kg·m²  ·  b=0.004' },
+  large:  { I: 0.080, b: 0.018,  tauMax: 3.00,  motorTau: 0.030, Kp: 1.2, Ki: 0.50, Kd: 0.15,  label: 'Large (7")',  sub: 'I=0.080 kg·m²  ·  b=0.018' },
+};
 
 function makeRng(seed) {
   let s = (seed || 1) >>> 0;
@@ -25,8 +40,9 @@ const COND_META = {
   pid_pinn:   { label: "PID + PINN  ★", color: "#16a34a" },
 };
 
-function rk4(theta, thetaDot, tauM, tauW) {
-  const f = (td) => (tauM - B * td - tauW) / I;
+// rk4 now accepts I and b as parameters
+function rk4(theta, thetaDot, tauM, tauW, I, b) {
+  const f = (td) => (tauM - b * td - tauW) / I;
   const k1d = f(thetaDot);
   const k2d = f(thetaDot + DT / 2 * k1d);
   const k3d = f(thetaDot + DT / 2 * k2d);
@@ -41,6 +57,7 @@ export default function ArmSim() {
   const [condition, setCondition] = useState("pid_pinn");
   const [windLevel, setWindLevel] = useState("moderate");
   const [gustCount, setGustCount] = useState(2);
+  const [armSize, setArmSize] = useState("medium");
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [simTime, setSimTime] = useState(0);
@@ -52,6 +69,7 @@ export default function ArmSim() {
   const [errorDeg, setErrorDeg] = useState(0);
   const [chartData, setChartData] = useState([]);
   const [gustMarkers, setGustMarkers] = useState([]);
+  const [metrics, setMetrics] = useState(null);
 
   const simRef = useRef(null);
   const animRef = useRef(null);
@@ -60,6 +78,7 @@ export default function ArmSim() {
   const chartBuf = useRef([]);
 
   const buildSim = useCallback(() => {
+    const arm = ARM_CONFIGS[armSize];
     const rng = makeRng(42 + gustCount * 7);
     const wp = WIND_PARAMS[windLevel];
     const a = Math.exp(-DT / wp.tau);
@@ -74,11 +93,19 @@ export default function ArmSim() {
       tauBuffer: new Array(20).fill(0),
       delayBuf: new Array(10).fill(0),
       pinnEst: 0, t: 0, rng, a, b_coeff, gustTimes, wp,
+      arm,
+      // Metrics accumulators
+      errSqAccum: 0, errMaxRad: 0, errSamples: [],
+      tauSqAccum: 0, metricsN: 0,
+      hitLimit: false,
     };
-  }, [windLevel, gustCount]);
+  }, [windLevel, gustCount, armSize]);
 
+  // stepSim reads all arm params from st.arm — no React deps needed
   const stepSim = useCallback((st, cond) => {
-    const { rng, a, b_coeff, gustTimes } = st;
+    const { rng, a, b_coeff, gustTimes, arm } = st;
+    const { I, b, tauMax, motorTau, Kp, Ki, Kd } = arm;
+
     st.windState = a * st.windState + b_coeff * gauss(rng);
     let tauW = st.windState;
     gustTimes.forEach((gt, i) => { if (st.t >= gt) tauW += (i % 2 === 0 ? 0.10 : -0.09); });
@@ -89,34 +116,56 @@ export default function ArmSim() {
     st.tauBuffer.shift(); st.tauBuffer.push(st.tauM);
 
     const tDotNow = st.gyroBuffer[19], tDotPrev = st.gyroBuffer[18];
-    const raw = st.tauBuffer[19] - B * tDotNow - I * (tDotNow - tDotPrev) / DT;
+    const raw = st.tauBuffer[19] - b * tDotNow - I * (tDotNow - tDotPrev) / DT;
     st.pinnEst = 0.15 * raw + 0.85 * st.pinnEst;
     st.delayBuf.shift(); st.delayBuf.push(st.pinnEst);
     const pinnOut = st.delayBuf[0];
 
     const sp = st.t >= 1.0 ? SP_RAD : 0;
-    const clip = v => Math.max(-TAU_MAX, Math.min(TAU_MAX, v));
+    const clip = v => Math.max(-tauMax, Math.min(tauMax, v));
     let tauCmd = 0;
 
-    if (cond === "no_control") { tauCmd = 0; }
-    else if (cond === "pid_only") {
+    if (cond === "no_control") {
+      tauCmd = 0;
+    } else if (cond === "pid_only") {
       const e = sp - st.theta; st.pidInt += e * DT;
-      tauCmd = clip(1.5*e + 0.80*st.pidInt + 0.10*(e - st.pidPrevErr)/DT);
+      tauCmd = clip(Kp*e + Ki*st.pidInt + Kd*(e - st.pidPrevErr)/DT);
       st.pidPrevErr = e;
     } else if (cond === "pinn_only") {
+      // PD only (Ki=0) + feedforward — mirrors Python B8 fix
       const e = sp - st.theta;
-      tauCmd = clip(1.5*e + 0.10*(e - st.pinnPrevErr)/DT + pinnOut);
+      tauCmd = clip(Kp*e + Kd*(e - st.pinnPrevErr)/DT + pinnOut);
       st.pinnPrevErr = e;
     } else {
       const e = sp - st.theta; st.pidInt += e * DT;
-      tauCmd = clip(1.5*e + 0.80*st.pidInt + 0.10*(e - st.pidPrevErr)/DT + pinnOut);
+      tauCmd = clip(Kp*e + Ki*st.pidInt + Kd*(e - st.pidPrevErr)/DT + pinnOut);
       st.pidPrevErr = e;
     }
 
-    const alpha = 1 - Math.exp(-DT / 0.020);
+    const alpha = 1 - Math.exp(-DT / motorTau);
     st.tauM = alpha * tauCmd + (1 - alpha) * st.tauM;
-    const [nt, ntd] = rk4(st.theta, st.thetaDot, st.tauM, tauW);
-    st.theta = nt; st.thetaDot = ntd; st.t += DT;
+    const [nt, ntd] = rk4(st.theta, st.thetaDot, st.tauM, tauW, I, b);
+
+    // Hard stop ±π — mirrors Python B7
+    if (nt > Math.PI) {
+      st.theta = Math.PI; st.thetaDot = Math.min(0, ntd); st.hitLimit = true;
+    } else if (nt < -Math.PI) {
+      st.theta = -Math.PI; st.thetaDot = Math.max(0, ntd); st.hitLimit = true;
+    } else {
+      st.theta = nt; st.thetaDot = ntd;
+    }
+    st.t += DT;
+
+    // Metrics accumulation (post-transient: t >= 1.0)
+    if (st.t >= 1.0) {
+      const errRad = Math.abs(SP_RAD - st.theta);
+      st.errSqAccum += errRad * errRad;
+      st.tauSqAccum += st.tauM * st.tauM;
+      st.metricsN++;
+      if (errRad > st.errMaxRad) st.errMaxRad = errRad;
+      if (Math.round(st.t * 1000) % 20 === 0) st.errSamples.push(errRad);
+    }
+
     return { tauW, tauCmd: st.tauM };
   }, []);
 
@@ -126,16 +175,15 @@ export default function ArmSim() {
     simRef.current = null;
     setSimTime(0); setArmAngle(0); setPropSpeed(0);
     setWindTorque(0); setMotorTorque(0); setErrorDeg(0);
-    setChartData([]); setPhase("READY");
+    setChartData([]); setPhase("READY"); setMetrics(null);
     propAngleRef.current = 0;
     setGustMarkers(Array.from({length: gustCount}, (_, g) =>
       3 + g * (10 / Math.max(gustCount, 1))
     ));
   }, [gustCount]);
 
-  useEffect(() => { reset(); }, [condition, windLevel, gustCount, reset]);
+  useEffect(() => { reset(); }, [condition, windLevel, gustCount, armSize, reset]);
 
-  // Fixed tick: steps = elapsed_ms * speed (since DT = 1ms, this gives exact real-time ratio)
   const tick = useCallback((ts) => {
     if (!simRef.current) return;
     if (!lastFrameRef.current) {
@@ -155,8 +203,8 @@ export default function ArmSim() {
       }
       const tDeg = st.theta * 180 / Math.PI;
       const err = (st.t >= 1 ? 10 : 0) - tDeg;
-      propAngleRef.current += (Math.abs(lastTauCmd) / TAU_MAX) * 18 * speed;
-      setArmAngle(st.theta); setPropSpeed(Math.abs(lastTauCmd) / TAU_MAX);
+      propAngleRef.current += (Math.abs(lastTauCmd) / st.arm.tauMax) * 18 * speed;
+      setArmAngle(st.theta); setPropSpeed(Math.abs(lastTauCmd) / st.arm.tauMax);
       setWindTorque(lastTauW); setMotorTorque(lastTauCmd); setErrorDeg(err);
       setSimTime(st.t);
       const active = st.gustTimes.some(gt => st.t >= gt && st.t < gt + 2);
@@ -166,7 +214,39 @@ export default function ArmSim() {
         if (chartBuf.current.length > 300) chartBuf.current.shift();
         setChartData([...chartBuf.current]);
       }
-      if (st.t >= 15) { setRunning(false); setPhase("DONE"); return; }
+      if (st.t >= 15) {
+        // ── Compute final metrics ─────────────────────────────────────────────
+        const { errSqAccum, errMaxRad, errSamples, tauSqAccum, metricsN, hitLimit, gustTimes } = st;
+        const rmsError   = metricsN > 0 ? Math.sqrt(errSqAccum / metricsN) * 180/Math.PI : 0;
+        const maxError   = errMaxRad * 180/Math.PI;
+        const sorted     = [...errSamples].sort((a, b) => a - b);
+        const p95Error   = sorted.length > 0 ? sorted[Math.floor(sorted.length * 0.95)] * 180/Math.PI : 0;
+        const ctrlEffort = metricsN > 0 ? Math.sqrt(tauSqAccum / metricsN) : 0;
+
+        // Gust recovery from chart buffer (mirrors Python _compute_recovery)
+        let worstRecovery = gustTimes.length === 0 ? -1 : 0;
+        const buf = chartBuf.current;
+        for (const gt of gustTimes) {
+          const onsetIdx = buf.findIndex(pt => pt.t >= gt);
+          if (onsetIdx < 0) continue;
+          let breachIdx = null;
+          for (let i = onsetIdx; i < buf.length; i++) {
+            if (buf[i].err >= RECOVERY_THRESHOLD_DEG) { breachIdx = i; break; }
+          }
+          if (breachIdx === null) { worstRecovery = Math.max(worstRecovery, 0); continue; }
+          let recovery = buf[buf.length - 1].t - buf[breachIdx].t;
+          for (let i = breachIdx + 1; i < buf.length; i++) {
+            if (buf[i].err < RECOVERY_THRESHOLD_DEG) {
+              recovery = buf[i].t - buf[breachIdx].t;
+              break;
+            }
+          }
+          worstRecovery = Math.max(worstRecovery, recovery);
+        }
+
+        setMetrics({ rmsError, maxError, p95Error, ctrlEffort, gustRecovery: worstRecovery, hitLimit });
+        setRunning(false); setPhase("DONE"); return;
+      }
     }
     animRef.current = requestAnimationFrame(tick);
   }, [condition, speed, stepSim]);
@@ -180,13 +260,15 @@ export default function ArmSim() {
   }, [running, tick, buildSim]);
 
   const meta = COND_META[condition];
-  const ANG = armAngle * 180 / Math.PI;
+  const arm  = ARM_CONFIGS[armSize];
+  const ANG  = armAngle * 180 / Math.PI;
   const absErr = Math.abs(errorDeg);
   const errColor = absErr < 1 ? "#16a34a" : absErr < 5 ? "#d97706" : "#dc2626";
   const windMag = Math.min(Math.abs(windTorque) / 0.18, 1);
   const windDir = windTorque >= 0 ? 1 : -1;
   const phaseColor = { READY:"#6b7280", SETTLING:"#9ca3af", TRACKING:"#16a34a", DONE:"#7c3aed" }[phase] || (phase.includes("GUST") ? "#dc2626" : "#16a34a");
-  const CX = 220, CY = 180, ARM = 130;
+  const { armLen, hubR, propLen, hubDot } = ARM_VISUAL[armSize];
+  const CX = 220, CY = 180, ARM = armLen;
   const ang = -armAngle;
   const mx = CX + ARM * Math.cos(ang), my = CY + ARM * Math.sin(ang);
   const cwx = CX - ARM * Math.cos(ang), cwy = CY - ARM * Math.sin(ang);
@@ -214,7 +296,7 @@ export default function ArmSim() {
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12, borderBottom:`1px solid ${borderSub}`, paddingBottom:10 }}>
         <div>
           <div style={{ color:meta.color, fontSize:14, fontWeight:700, letterSpacing:"0.18em" }}>◈ 1-DoF PINN DISTURBANCE OBSERVER</div>
-          <div style={{ color:txtDim, fontSize:10, marginTop:3 }}>I=0.008 kg·m²  ·  b=0.004 N·m·s/rad  ·  RK4 @ 1kHz  ·  Dryden turbulence</div>
+          <div style={{ color:txtDim, fontSize:10, marginTop:3 }}>{arm.sub}  ·  RK4 @ 1kHz  ·  Dryden turbulence</div>
         </div>
         <div style={{ textAlign:"right" }}>
           <div style={{ color:txtPri, fontSize:18, fontWeight:700 }}>{simTime.toFixed(2)}<span style={{ fontSize:10, color:txtDim }}>s / 15.00s</span></div>
@@ -234,6 +316,18 @@ export default function ArmSim() {
           {/* Config panel */}
           <div style={{ background:cardBg, border:`1px solid ${border}`, borderRadius:8, padding:14 }}>
             <div style={{ fontSize:11, color:txtSec, fontWeight:700, letterSpacing:"0.12em", marginBottom:10 }}>── EXPERIMENT CONFIGURATION</div>
+
+            {/* Arm size selector — NEW */}
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:10, color:txtSec, fontWeight:600, marginBottom:5 }}>DRONE ARM SIZE</div>
+              <div style={{ display:"flex", gap:4 }}>
+                {Object.entries(ARM_CONFIGS).map(([k, v]) => (
+                  <button key={k} onClick={() => setArmSize(k)} style={{ flex:1, background:armSize===k?"#dbeafe":cardAlt, border:`1px solid ${armSize===k?"#3b82f6":border}`, color:armSize===k?"#1d4ed8":txtSec, padding:"7px 6px", borderRadius:4, cursor:"pointer", fontFamily:"'Courier New', monospace", fontSize:10, fontWeight:armSize===k?700:400, textAlign:"center" }}>{v.label}</button>
+                ))}
+              </div>
+              <div style={{ fontSize:9, color:txtDim, marginTop:3 }}>τ_max={arm.tauMax} N·m  ·  Kp={arm.Kp}  Ki={arm.Ki}  Kd={arm.Kd}</div>
+            </div>
+
             <div style={{ marginBottom:10 }}>
               <div style={{ fontSize:10, color:txtSec, fontWeight:600, marginBottom:5 }}>CONTROL ARCHITECTURE</div>
               <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:4 }}>
@@ -294,15 +388,15 @@ export default function ArmSim() {
               <line x1={cwx+3} y1={cwy+3} x2={mx+3} y2={my+3} stroke="rgba(0,0,0,0.12)" strokeWidth={10} strokeLinecap="round"/>
               <line x1={cwx} y1={cwy} x2={mx} y2={my} stroke={meta.color} strokeWidth={7} strokeLinecap="round" opacity={0.9}/>
               <line x1={cwx} y1={cwy} x2={mx} y2={my} stroke="rgba(255,255,255,0.4)" strokeWidth={2} strokeLinecap="round"/>
-              <circle cx={mx} cy={my} r={18} fill={cardBg} stroke={meta.color} strokeWidth={2.5}/>
-              <circle cx={mx} cy={my} r={5} fill={meta.color} opacity={0.7}/>
+              <circle cx={mx} cy={my} r={hubR} fill={cardBg} stroke={meta.color} strokeWidth={2.5}/>
+              <circle cx={mx} cy={my} r={hubDot} fill={meta.color} opacity={0.7}/>
               {[0,Math.PI/2,Math.PI,3*Math.PI/2].map((offset,i) => {
                 const ba = propA+offset;
-                return <line key={i} x1={mx+14*Math.cos(ba)} y1={my+14*Math.sin(ba)} x2={mx-14*Math.cos(ba)} y2={my-14*Math.sin(ba)} stroke={meta.color} strokeWidth={3} strokeLinecap="round" opacity={0.5+propSpeed*0.4}/>;
+                return <line key={i} x1={mx+propLen*Math.cos(ba)} y1={my+propLen*Math.sin(ba)} x2={mx-propLen*Math.cos(ba)} y2={my-propLen*Math.sin(ba)} stroke={meta.color} strokeWidth={3} strokeLinecap="round" opacity={0.5+propSpeed*0.4}/>;
               })}
               {propSpeed > 0.2 && <>
-                <circle cx={mx} cy={my} r={22+propSpeed*8} fill="none" stroke={meta.color} strokeWidth={0.8} opacity={0.1+propSpeed*0.12}/>
-                <circle cx={mx} cy={my} r={28+propSpeed*14} fill="none" stroke={meta.color} strokeWidth={0.5} opacity={0.06+propSpeed*0.07}/>
+                <circle cx={mx} cy={my} r={hubR+4+propSpeed*8} fill="none" stroke={meta.color} strokeWidth={0.8} opacity={0.1+propSpeed*0.12}/>
+                <circle cx={mx} cy={my} r={hubR+10+propSpeed*14} fill="none" stroke={meta.color} strokeWidth={0.5} opacity={0.06+propSpeed*0.07}/>
               </>}
               <rect x={cwx-10} y={cwy-10} width={20} height={20} rx={4} fill={borderSub} stroke={txtDim} strokeWidth={1.5}/>
               <line x1={cwx-6} y1={cwy-6} x2={cwx+6} y2={cwy+6} stroke={txtDim} strokeWidth={1}/>
@@ -400,13 +494,50 @@ export default function ArmSim() {
             </svg>
           </div>
 
-          {/* Legend */}
-          <div style={{ display:"flex", gap:16, justifyContent:"center", flexWrap:"wrap", padding:"6px 0", borderTop:`1px solid ${borderSub}`, fontSize:10, color:txtSec, fontWeight:500 }}>
-            <span>▏ Red markers = gust events</span>
-            <span>▏ Ghost arm = setpoint 10°</span>
-            <span>▏ Purple arrows = wind direction &amp; magnitude</span>
-            <span>▏ Prop blur speed ∝ motor torque</span>
-          </div>
+          {/* Metrics report (shown when DONE) or legend */}
+          {phase === "DONE" && metrics ? (
+            <div style={{ background:cardBg, border:`1px solid ${metrics.hitLimit?"#dc2626":meta.color}`, borderRadius:8, padding:"12px 14px" }}>
+              <div style={{ fontSize:11, color:txtPri, fontWeight:700, letterSpacing:"0.12em", marginBottom:8, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <span>── SIMULATION RESULTS  ·  {arm.label}  ·  {meta.label}</span>
+                {metrics.hitLimit && <span style={{ color:"#dc2626", fontSize:10, fontWeight:700 }}>⚠ HIT PHYSICAL LIMIT (±180°)</span>}
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:6 }}>
+                {[
+                  { label:"RMS ERROR",     value:`${metrics.rmsError.toFixed(3)}°`,   color: metrics.rmsError < 1 ? "#16a34a" : metrics.rmsError < 5 ? "#d97706" : "#dc2626" },
+                  { label:"MAX ERROR",     value:`${metrics.maxError.toFixed(2)}°`,    color: metrics.maxError < 5 ? "#16a34a" : metrics.maxError < 15 ? "#d97706" : "#dc2626" },
+                  { label:"P95 ERROR",     value:`${metrics.p95Error.toFixed(3)}°`,    color: metrics.p95Error < 2 ? "#16a34a" : metrics.p95Error < 8 ? "#d97706" : "#dc2626" },
+                  { label:"CTRL EFFORT",   value:`${metrics.ctrlEffort.toFixed(4)} N·m`, color:"#d97706" },
+                  { label:"GUST RECOVERY",
+                    value: metrics.gustRecovery < 0 ? "N/A (no gusts)"
+                         : metrics.gustRecovery === 0 ? "0.00s ✓"
+                         : `${metrics.gustRecovery.toFixed(2)}s`,
+                    color: metrics.gustRecovery < 0 ? txtDim
+                         : metrics.gustRecovery === 0 ? "#16a34a"
+                         : metrics.gustRecovery < 1   ? "#16a34a"
+                         : metrics.gustRecovery < 3   ? "#d97706"
+                         : "#dc2626"
+                  },
+                ].map(s => (
+                  <div key={s.label} style={{ background:cardAlt, border:`1px solid ${borderSub}`, borderRadius:6, padding:"8px 10px" }}>
+                    <div style={{ fontSize:9, color:txtDim, fontWeight:600, letterSpacing:"0.10em", marginBottom:4 }}>{s.label}</div>
+                    <div style={{ fontSize:13, color:s.color, fontWeight:700 }}>{s.value}</div>
+                  </div>
+                ))}
+              </div>
+              {metrics.hitLimit && (
+                <div style={{ marginTop:8, fontSize:9, color:"#dc2626", background:"#fef2f2", border:"1px solid #fca5a5", borderRadius:4, padding:"5px 8px" }}>
+                  Arm reached physical stop (±180°). Metrics computed up to stop point. Small arm under moderate/severe wind is expected to saturate (τ_max={arm.tauMax} N·m).
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ display:"flex", gap:16, justifyContent:"center", flexWrap:"wrap", padding:"6px 0", borderTop:`1px solid ${borderSub}`, fontSize:10, color:txtSec, fontWeight:500 }}>
+              <span>▏ Red markers = gust events</span>
+              <span>▏ Ghost arm = setpoint 10°</span>
+              <span>▏ Purple arrows = wind direction &amp; magnitude</span>
+              <span>▏ Prop blur speed ∝ motor torque</span>
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -28,3 +28,7 @@ Research Paper /
 # Node modules
 node_modules/
 package-lock.json
+
+# Generated simulation outputs
+results/simulation_sweep.csv
+results/plots/

@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@sim": path.resolve(__dirname, "../1dof_pinn/sim"),
+      "@": path.resolve(__dirname, "."),
     },
   },
 });
